@@ -1,0 +1,1379 @@
+# Load required packages
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("ggpubr")) install.packages("ggpubr")
+
+# Load the libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+
+# Set your file paths for your environment 
+lobed_file <- "EXTRACT POPULATION FILE1 (EXTRACT OF VECTORIZED DATA) "
+round_file <- "EXTRACT POPULATION GENETICS FILE2 (EXTRACT OF VECTORIZED DATA) "
+output_dir <- "YOUR OUTPUT DIRECTORY"
+
+dir.create(output_dir, showWarnings = FALSE)
+
+# Create subdirectories for better organization
+chrom_plots_dir <- file.path(output_dir, "chromosome_plots")
+dir.create(chrom_plots_dir, showWarnings = FALSE)
+
+advanced_plots_dir <- file.path(output_dir, "advanced_plots")
+dir.create(advanced_plots_dir, showWarnings = FALSE)
+
+tables_dir <- file.path(output_dir, "tables")
+dir.create(tables_dir, showWarnings = FALSE)
+
+fst_comparison_dir <- file.path(output_dir, "fst_comparison")
+dir.create(fst_comparison_dir, showWarnings = FALSE)
+
+# Function to parse a population extract file
+parse_population_file <- function(file_path, population_name) {
+  cat("Reading", population_name, "data from:", file_path, "\n")
+  
+  # Check if file exists
+  if (!file.exists(file_path)) {
+    stop("File not found: ", file_path)
+  }
+  
+  # Read the data
+  data <- read.table(file_path, header = FALSE, stringsAsFactors = FALSE, 
+                     sep = "\t", quote = "", comment.char = "")
+  
+  # Set column names
+  colnames(data) <- c("CHROM", "POS", "REF", "ALT", "GENOTYPE_INFO")
+  
+  # Filter to keep only rows where CHROM contains "chr"
+  data <- data[grepl("chr", data$CHROM, ignore.case = TRUE), ]
+  
+  # Report number of rows after filtering
+  cat("Number of rows after filtering for chromosomes:", nrow(data), "\n")
+  
+  # Extract just the genotype part (before the colon)
+  data$GENOTYPE <- sapply(strsplit(data$GENOTYPE_INFO, ":"), function(x) x[1])
+  
+  # For debugging
+  cat("First few genotypes:", head(data$GENOTYPE), "\n")
+  
+  # Count and report multi-allelic sites
+  multi_allelic <- grepl("2", data$GENOTYPE)
+  cat("Number of multi-allelic sites found:", sum(multi_allelic), "\n")
+  
+  # Convert genotypes to allele frequencies - now handling 1/2 and other multi-allelic cases
+  data$FREQ <- sapply(data$GENOTYPE, function(gt) {
+    # Skip NA values
+    if(is.na(gt)) return(NA)
+    
+    # Handle different genotype formats
+    if(gt == "0/0") return(0)
+    else if(gt == "0/1" || gt == "1/0") return(0.5)
+    else if(gt == "1/1") return(1)
+    else if(gt == "./.") return(NA)
+    else if(gt == "0/2" || gt == "2/0") return(0.5)  # Treating other alt alleles as "non-reference"
+    else if(gt == "1/2" || gt == "2/1") return(1)    # Both are alt alleles
+    else if(gt == "2/2") return(1)                   # Homozygous for second alt allele
+    else {
+      # For other unexpected formats, just return NA
+      return(NA)
+    }
+  })
+  
+  # Add population column
+  data$POPULATION <- population_name
+  
+  return(data)
+}
+
+# Function to merge population data and calculate statistics
+calculate_pop_stats <- function(lobed_data, round_data) {
+  # Create a joined dataset with aligned positions
+  cat("Creating merged dataset for analysis...\n")
+  
+  # Get unique chromosomes
+  chromosomes <- unique(c(lobed_data$CHROM, round_data$CHROM))
+  
+  all_stats <- data.frame()
+  
+  # Process each chromosome
+  for(chrom in chromosomes) {
+    cat("Processing chromosome:", chrom, "\n")
+    
+    # Filter data for this chromosome
+    lobed_chrom <- lobed_data[lobed_data$CHROM == chrom,]
+    round_chrom <- round_data[round_data$CHROM == chrom,]
+    
+    # Find shared positions
+    shared_pos <- intersect(lobed_chrom$POS, round_chrom$POS)
+    
+    if(length(shared_pos) > 0) {
+      # Filter for shared positions
+      lobed_shared <- lobed_chrom[lobed_chrom$POS %in% shared_pos,]
+      round_shared <- round_chrom[round_chrom$POS %in% shared_pos,]
+      
+      # Make sure data is sorted by position
+      lobed_shared <- lobed_shared[order(lobed_shared$POS),]
+      round_shared <- round_shared[order(round_shared$POS),]
+      
+      # Create a combined dataset for analysis
+      combined <- data.frame(
+        CHROM = lobed_shared$CHROM,
+        POS = lobed_shared$POS,
+        REF = lobed_shared$REF,
+        ALT = lobed_shared$ALT,
+        LOBED_GENOTYPE = lobed_shared$GENOTYPE,
+        ROUND_GENOTYPE = round_shared$GENOTYPE,
+        LOBED_FREQ = lobed_shared$FREQ,
+        ROUND_FREQ = round_shared$FREQ
+      )
+      
+      # Remove rows with NA frequencies
+      combined <- combined[!is.na(combined$LOBED_FREQ) & !is.na(combined$ROUND_FREQ),]
+      
+      if(nrow(combined) > 0) {
+        # Calculate statistics for each site
+        combined <- combined %>%
+          mutate(
+            # Calculate p_bar (average allele frequency)
+            p_bar = (LOBED_FREQ + ROUND_FREQ) / 2,
+            
+            # Calculate components for Original FST
+            h_bar = 2 * p_bar * (1 - p_bar),
+            s2 = ((LOBED_FREQ - p_bar)^2 + (ROUND_FREQ - p_bar)^2) / 2,
+            
+            # Calculate Original FST (Nei's GST)
+            FST = ifelse(h_bar > 0, s2 / (s2 + h_bar), NA),
+            
+            # Calculate Hudson's FST
+            # FST = 1 - Hw/Hb where Hw is average within-population heterozygosity and Hb is between-population heterozygosity
+            Hw = (2 * LOBED_FREQ * (1 - LOBED_FREQ) + 2 * ROUND_FREQ * (1 - ROUND_FREQ)) / 2,
+            Hb = LOBED_FREQ * (1 - ROUND_FREQ) + ROUND_FREQ * (1 - LOBED_FREQ),
+            HUDSON_FST = ifelse(Hb > 0, 1 - (Hw / Hb), NA),
+            
+            # Calculate Weir and Cockerham's FST
+            # This is a more complex calculation considering sample sizes
+            # We're using a simplification here assuming equal sample sizes
+            n1 = 68, # Placeholder for lobed sample size - replace with real value
+            n2 = 75, # Placeholder for round sample size - replace with real value
+            n_samples = n1 + n2,
+            p1 = LOBED_FREQ,
+            p2 = ROUND_FREQ,
+            p_avg = (n1*p1 + n2*p2) / n_samples,
+            s2_WC = ((n1*(p1 - p_avg)^2 + n2*(p2 - p_avg)^2)) / ((n_samples - 1)/2),
+            h1 = 2 * p1 * (1 - p1),
+            h2 = 2 * p2 * (1 - p2),
+            h_avg = (n1*h1 + n2*h2) / n_samples,
+            WC_FST = ifelse(s2_WC + h_avg > 0, s2_WC / (s2_WC + h_avg), NA),
+            
+            # Calculate Pi for each population
+            PI_LOBED = 2 * LOBED_FREQ * (1 - LOBED_FREQ),
+            PI_ROUND = 2 * ROUND_FREQ * (1 - ROUND_FREQ),
+            
+            # Calculate DXY
+            DXY = LOBED_FREQ * (1 - ROUND_FREQ) + ROUND_FREQ * (1 - LOBED_FREQ)
+          )
+        
+        all_stats <- rbind(all_stats, combined)
+      }
+    }
+  }
+  
+  return(all_stats)
+}
+
+# Function to calculate windowed statistics
+calculate_windowed_stats <- function(stats_data, window_size = 25000, step_size = 10000) {
+  cat("Calculating windowed statistics \n")
+  
+  # Get unique chromosomes
+  chromosomes <- unique(stats_data$CHROM)
+  
+  all_windows <- data.frame()
+  
+  # Process each chromosome
+  for(chrom in chromosomes) {
+    cat("Processing windowed analysis for chromosome:", chrom, "\n")
+    
+    # Filter data for this chromosome
+    chrom_data <- stats_data[stats_data$CHROM == chrom,]
+    
+    # Calculate maximum position
+    max_pos <- max(chrom_data$POS, na.rm = TRUE)
+    
+    # Create windows
+    start_positions <- seq(1, max_pos, by = step_size)
+    
+    for(start_pos in start_positions) {
+      end_pos <- start_pos + window_size - 1
+      
+      # Get SNPs in this window
+      window_data <- chrom_data[chrom_data$POS >= start_pos & chrom_data$POS <= end_pos,]
+      
+      if(nrow(window_data) > 0) {
+        # Calculate window statistics
+        window_summary <- data.frame(
+          CHROM = chrom,
+          START = start_pos,
+          END = end_pos,
+          N_SNPS = nrow(window_data),
+          MEAN_FST = mean(window_data$FST, na.rm = TRUE),
+          MEDIAN_FST = median(window_data$FST, na.rm = TRUE),
+          MEAN_HUDSON_FST = mean(window_data$HUDSON_FST, na.rm = TRUE),
+          MEDIAN_HUDSON_FST = median(window_data$HUDSON_FST, na.rm = TRUE),
+          MEAN_WC_FST = mean(window_data$WC_FST, na.rm = TRUE),
+          MEDIAN_WC_FST = median(window_data$WC_FST, na.rm = TRUE),
+          MEAN_PI_LOBED = mean(window_data$PI_LOBED, na.rm = TRUE),
+          MEAN_PI_ROUND = mean(window_data$PI_ROUND, na.rm = TRUE),
+          MEAN_DXY = mean(window_data$DXY, na.rm = TRUE)
+        )
+        
+        all_windows <- rbind(all_windows, window_summary)
+      }
+    }
+  }
+  
+  return(all_windows)
+}
+
+# Function to identify FST outlier windows
+identify_fst_outliers <- function(windowed_data, threshold = 0.95) {
+  cat("Identifying FST outlier windows...\n")
+  
+  # Calculate the threshold values (e.g., 95th percentile)
+  fst_threshold <- quantile(windowed_data$MEAN_FST, threshold, na.rm = TRUE)
+  hudson_fst_threshold <- quantile(windowed_data$MEAN_HUDSON_FST, threshold, na.rm = TRUE)
+  wc_fst_threshold <- quantile(windowed_data$MEAN_WC_FST, threshold, na.rm = TRUE)
+  
+  # Identify windows above the threshold
+  outliers <- windowed_data %>%
+    mutate(
+      FST_OUTLIER = MEAN_FST > fst_threshold,
+      HUDSON_FST_OUTLIER = MEAN_HUDSON_FST > hudson_fst_threshold,
+      WC_FST_OUTLIER = MEAN_WC_FST > wc_fst_threshold
+    ) %>%
+    filter(FST_OUTLIER | HUDSON_FST_OUTLIER | WC_FST_OUTLIER) %>%
+    select(CHROM, START, END, N_SNPS, MEAN_FST, MEAN_HUDSON_FST, MEAN_WC_FST, 
+           FST_OUTLIER, HUDSON_FST_OUTLIER, WC_FST_OUTLIER)
+  
+  return(outliers)
+}
+
+# Function to identify genomic islands (consecutive outlier windows)
+identify_genomic_islands <- function(outliers, max_distance = 50000) {
+  cat("Identifying genomic islands of divergence...\n")
+  
+  # Sort outliers by chromosome and position
+  outliers <- outliers %>% 
+    arrange(CHROM, START)
+  
+  # Initialize island identification
+  islands <- list()
+  current_island <- NULL
+  island_count <- 0
+  
+  # Process outliers to identify islands
+  for(i in 1:nrow(outliers)) {
+    current_window <- outliers[i, ]
+    
+    # Start a new island if none exists
+    if(is.null(current_island)) {
+      current_island <- current_window
+      next
+    }
+    
+    # Check if this window belongs to the current island
+    same_chrom <- current_window$CHROM == current_island$CHROM[nrow(current_island)]
+    close_enough <- (current_window$START - current_island$END[nrow(current_island)]) <= max_distance
+    
+    if(same_chrom && close_enough) {
+      # Add window to current island
+      current_island <- rbind(current_island, current_window)
+    } else {
+      # Finish current island if it has at least 2 windows
+      if(nrow(current_island) >= 2) {
+        island_count <- island_count + 1
+        islands[[island_count]] <- current_island
+      }
+      # Start a new island
+      current_island <- current_window
+    }
+  }
+  
+  # Check the final island
+  if(!is.null(current_island) && nrow(current_island) >= 2) {
+    island_count <- island_count + 1
+    islands[[island_count]] <- current_island
+  }
+  
+  # Create a summary of all islands
+  island_summary <- data.frame()
+  
+  for(i in 1:length(islands)) {
+    island <- islands[[i]]
+    summary_row <- data.frame(
+      ISLAND_ID = i,
+      CHROM = unique(island$CHROM),
+      START = min(island$START),
+      END = max(island$END),
+      SIZE = max(island$END) - min(island$START) + 1,
+      N_WINDOWS = nrow(island),
+      MEAN_FST = mean(island$MEAN_FST, na.rm = TRUE),
+      MEAN_HUDSON_FST = mean(island$MEAN_HUDSON_FST, na.rm = TRUE),
+      MEAN_WC_FST = mean(island$MEAN_WC_FST, na.rm = TRUE)
+    )
+    island_summary <- rbind(island_summary, summary_row)
+  }
+  
+  return(island_summary)
+}
+
+# Function to identify top outlier sites
+identify_top_outliers <- function(site_stats, n_top = 100) {
+  cat("Identifying top outlier sites...\n")
+  
+  # Calculate genome-wide means and standard deviations for finding >3SD outliers
+  genome_mean_fst <- mean(site_stats$FST, na.rm = TRUE)
+  genome_sd_fst <- sd(site_stats$FST, na.rm = TRUE)
+  
+  genome_mean_hudson_fst <- mean(site_stats$HUDSON_FST, na.rm = TRUE)
+  genome_sd_hudson_fst <- sd(site_stats$HUDSON_FST, na.rm = TRUE)
+  
+  genome_mean_wc_fst <- mean(site_stats$WC_FST, na.rm = TRUE)
+  genome_sd_wc_fst <- sd(site_stats$WC_FST, na.rm = TRUE)
+  
+  genome_mean_dxy <- mean(site_stats$DXY, na.rm = TRUE)
+  genome_sd_dxy <- sd(site_stats$DXY, na.rm = TRUE)
+  
+  # Identify sites exceeding 3 SDs from the mean (both directions)
+  outliers_3sd <- site_stats %>%
+    mutate(
+      FST_Z_SCORE = (FST - genome_mean_fst) / genome_sd_fst,
+      HUDSON_FST_Z_SCORE = (HUDSON_FST - genome_mean_hudson_fst) / genome_sd_hudson_fst,
+      WC_FST_Z_SCORE = (WC_FST - genome_mean_wc_fst) / genome_sd_wc_fst,
+      DXY_Z_SCORE = (DXY - genome_mean_dxy) / genome_sd_dxy
+    ) %>%
+    filter(abs(FST_Z_SCORE) > 3 | abs(HUDSON_FST_Z_SCORE) > 3 | 
+             abs(WC_FST_Z_SCORE) > 3 | abs(DXY_Z_SCORE) > 3) %>%
+    select(CHROM, POS, REF, ALT, LOBED_FREQ, ROUND_FREQ, 
+           FST, FST_Z_SCORE, 
+           HUDSON_FST, HUDSON_FST_Z_SCORE,
+           WC_FST, WC_FST_Z_SCORE,
+           DXY, DXY_Z_SCORE)
+  
+  # Top FST outliers
+  top_fst <- site_stats %>%
+    arrange(desc(FST)) %>%
+    head(n_top) %>%
+    select(CHROM, POS, REF, ALT, LOBED_FREQ, ROUND_FREQ, FST, HUDSON_FST, WC_FST)
+  
+  # Top Pi differential outliers (sites with high difference in Pi)
+  top_pi_diff <- site_stats %>%
+    mutate(PI_DIFF = abs(PI_LOBED - PI_ROUND)) %>%
+    arrange(desc(PI_DIFF)) %>%
+    head(n_top) %>%
+    select(CHROM, POS, REF, ALT, PI_LOBED, PI_ROUND, PI_DIFF)
+  
+  # Top DXY outliers
+  top_dxy <- site_stats %>%
+    arrange(desc(DXY)) %>%
+    head(n_top) %>%
+    select(CHROM, POS, REF, ALT, LOBED_FREQ, ROUND_FREQ, DXY)
+  
+  return(list(
+    top_fst = top_fst,
+    top_pi_diff = top_pi_diff,
+    top_dxy = top_dxy,
+    outliers_3sd = outliers_3sd
+  ))
+}
+
+# Function to summarize statistics by chromosome and calculate significance
+summarize_by_chrom <- function(stats_data) {
+  cat("Generating chromosome summaries with significance tests...\n")
+  
+  # First create basic summaries
+  summary <- stats_data %>%
+    group_by(CHROM) %>%
+    summarize(
+      N_SNPS = n(),
+      MEAN_FST = mean(FST, na.rm = TRUE),
+      MEDIAN_FST = median(FST, na.rm = TRUE),
+      MEAN_HUDSON_FST = mean(HUDSON_FST, na.rm = TRUE),
+      MEDIAN_HUDSON_FST = median(HUDSON_FST, na.rm = TRUE),
+      MEAN_WC_FST = mean(WC_FST, na.rm = TRUE),
+      MEDIAN_WC_FST = median(WC_FST, na.rm = TRUE),
+      MEAN_PI_LOBED = mean(PI_LOBED, na.rm = TRUE),
+      MEAN_PI_ROUND = mean(PI_ROUND, na.rm = TRUE),
+      MEAN_DXY = mean(DXY, na.rm = TRUE)
+    )
+  
+  # Calculate genome-wide means for each metric
+  genome_mean_fst <- mean(stats_data$FST, na.rm = TRUE)
+  genome_mean_hudson_fst <- mean(stats_data$HUDSON_FST, na.rm = TRUE)
+  genome_mean_wc_fst <- mean(stats_data$WC_FST, na.rm = TRUE)
+  genome_mean_pi_lobed <- mean(stats_data$PI_LOBED, na.rm = TRUE)
+  genome_mean_pi_round <- mean(stats_data$PI_ROUND, na.rm = TRUE)
+  genome_mean_dxy <- mean(stats_data$DXY, na.rm = TRUE)
+  
+  # Calculate standard deviations for each metric
+  genome_sd_fst <- sd(stats_data$FST, na.rm = TRUE)
+  genome_sd_hudson_fst <- sd(stats_data$HUDSON_FST, na.rm = TRUE)
+  genome_sd_wc_fst <- sd(stats_data$WC_FST, na.rm = TRUE)
+  genome_sd_pi_lobed <- sd(stats_data$PI_LOBED, na.rm = TRUE)
+  genome_sd_pi_round <- sd(stats_data$PI_ROUND, na.rm = TRUE)
+  genome_sd_dxy <- sd(stats_data$DXY, na.rm = TRUE)
+  
+  # Add initial p-values (uncorrected)
+  summary <- summary %>%
+    mutate(
+      # Z-scores
+      FST_Z_SCORE = (MEAN_FST - genome_mean_fst) / genome_sd_fst,
+      HUDSON_FST_Z_SCORE = (MEAN_HUDSON_FST - genome_mean_hudson_fst) / genome_sd_hudson_fst,
+      WC_FST_Z_SCORE = (MEAN_WC_FST - genome_mean_wc_fst) / genome_sd_wc_fst,
+      PI_LOBED_Z_SCORE = (MEAN_PI_LOBED - genome_mean_pi_lobed) / genome_sd_pi_lobed,
+      PI_ROUND_Z_SCORE = (MEAN_PI_ROUND - genome_mean_pi_round) / genome_sd_pi_round,
+      DXY_Z_SCORE = (MEAN_DXY - genome_mean_dxy) / genome_sd_dxy,
+      
+      # P-values (two-tailed test assuming normal distribution)
+      FST_P_VALUE = 2 * pnorm(-abs(FST_Z_SCORE)),
+      HUDSON_FST_P_VALUE = 2 * pnorm(-abs(HUDSON_FST_Z_SCORE)),
+      WC_FST_P_VALUE = 2 * pnorm(-abs(WC_FST_Z_SCORE)),
+      PI_LOBED_P_VALUE = 2 * pnorm(-abs(PI_LOBED_Z_SCORE)),
+      PI_ROUND_P_VALUE = 2 * pnorm(-abs(PI_ROUND_Z_SCORE)),
+      DXY_P_VALUE = 2 * pnorm(-abs(DXY_Z_SCORE))
+    )
+  
+  # FDR Correction Implementation
+  summary <- summary %>%
+    mutate(
+      FST_P_ADJ = p.adjust(FST_P_VALUE, method = "fdr"),
+      HUDSON_FST_P_ADJ = p.adjust(HUDSON_FST_P_VALUE, method = "fdr"),
+      WC_FST_P_ADJ = p.adjust(WC_FST_P_VALUE, method = "fdr"),
+      PI_LOBED_P_ADJ = p.adjust(PI_LOBED_P_VALUE, method = "fdr"),
+      PI_ROUND_P_ADJ = p.adjust(PI_ROUND_P_VALUE, method = "fdr"),
+      DXY_P_ADJ = p.adjust(DXY_P_VALUE, method = "fdr")
+    )
+  
+  # Add significance markers using FDR adjusted p-values
+  summary <- summary %>%
+    mutate(
+      FST_SIG_FDR = case_when(
+        FST_P_ADJ < 0.001 ~ "***",
+        FST_P_ADJ < 0.01 ~ "**",
+        FST_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      HUDSON_FST_SIG_FDR = case_when(
+        HUDSON_FST_P_ADJ < 0.001 ~ "***",
+        HUDSON_FST_P_ADJ < 0.01 ~ "**",
+        HUDSON_FST_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      WC_FST_SIG_FDR = case_when(
+        WC_FST_P_ADJ < 0.001 ~ "***",
+        WC_FST_P_ADJ < 0.01 ~ "**",
+        WC_FST_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      PI_LOBED_SIG_FDR = case_when(
+        PI_LOBED_P_ADJ < 0.001 ~ "***",
+        PI_LOBED_P_ADJ < 0.01 ~ "**",
+        PI_LOBED_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      PI_ROUND_SIG_FDR = case_when(
+        PI_ROUND_P_ADJ < 0.001 ~ "***",
+        PI_ROUND_P_ADJ < 0.01 ~ "**",
+        PI_ROUND_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      DXY_SIG_FDR = case_when(
+        DXY_P_ADJ < 0.001 ~ "***",
+        DXY_P_ADJ < 0.01 ~ "**",
+        DXY_P_ADJ < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+  
+  # Add genome-wide means and SDs as attributes
+  attr(summary, "genome_means") <- c(
+    FST = genome_mean_fst,
+    HUDSON_FST = genome_mean_hudson_fst,
+    WC_FST = genome_mean_wc_fst,
+    PI_LOBED = genome_mean_pi_lobed,
+    PI_ROUND = genome_mean_pi_round,
+    DXY = genome_mean_dxy
+  )
+  
+  attr(summary, "genome_sds") <- c(
+    FST = genome_sd_fst,
+    HUDSON_FST = genome_sd_hudson_fst,
+    WC_FST = genome_sd_wc_fst,
+    PI_LOBED = genome_sd_pi_lobed,
+    PI_ROUND = genome_sd_pi_round,
+    DXY = genome_sd_dxy
+  )
+  
+  return(summary)
+}
+
+# Function to create a table of significant sites
+create_significance_table <- function(site_stats, alpha = 0.05) {
+  cat("Creating table of sites that exceed significance threshold...\n")
+  
+  # Calculate genome-wide means and standard deviations
+  genome_mean_fst <- mean(site_stats$FST, na.rm = TRUE)
+  genome_sd_fst <- sd(site_stats$FST, na.rm = TRUE)
+  
+  genome_mean_dxy <- mean(site_stats$DXY, na.rm = TRUE)
+  genome_sd_dxy <- sd(site_stats$DXY, na.rm = TRUE)
+  
+  genome_mean_pi_lobed <- mean(site_stats$PI_LOBED, na.rm = TRUE)
+  genome_sd_pi_lobed <- sd(site_stats$PI_LOBED, na.rm = TRUE)
+  
+  genome_mean_pi_round <- mean(site_stats$PI_ROUND, na.rm = TRUE)
+  genome_sd_pi_round <- sd(site_stats$PI_ROUND, na.rm = TRUE)
+  
+  # Calculate z-scores for each site
+  site_stats$FST_Z_SCORE <- (site_stats$FST - genome_mean_fst) / genome_sd_fst
+  site_stats$DXY_Z_SCORE <- (site_stats$DXY - genome_mean_dxy) / genome_sd_dxy
+  site_stats$PI_LOBED_Z_SCORE <- (site_stats$PI_LOBED - genome_mean_pi_lobed) / genome_sd_pi_lobed
+  site_stats$PI_ROUND_Z_SCORE <- (site_stats$PI_ROUND - genome_mean_pi_round) / genome_sd_pi_round
+  
+  # Calculate p-values
+  site_stats$FST_P_VALUE <- 2 * pnorm(-abs(site_stats$FST_Z_SCORE))
+  site_stats$DXY_P_VALUE <- 2 * pnorm(-abs(site_stats$DXY_Z_SCORE))
+  site_stats$PI_LOBED_P_VALUE <- 2 * pnorm(-abs(site_stats$PI_LOBED_Z_SCORE))
+  site_stats$PI_ROUND_P_VALUE <- 2 * pnorm(-abs(site_stats$PI_ROUND_Z_SCORE))
+  
+  # Calculate adjusted p-values using FDR correction
+  site_stats$FST_P_ADJ <- p.adjust(site_stats$FST_P_VALUE, method = "fdr")
+  site_stats$DXY_P_ADJ <- p.adjust(site_stats$DXY_P_VALUE, method = "fdr")
+  site_stats$PI_LOBED_P_ADJ <- p.adjust(site_stats$PI_LOBED_P_VALUE, method = "fdr")
+  site_stats$PI_ROUND_P_ADJ <- p.adjust(site_stats$PI_ROUND_P_VALUE, method = "fdr")
+  
+  # Identify significant sites based on adjusted p-values
+  significant_sites <- site_stats %>%
+    filter(FST_P_ADJ < alpha | DXY_P_ADJ < alpha | PI_LOBED_P_ADJ < alpha | PI_ROUND_P_ADJ < alpha) %>%
+    select(CHROM, POS, REF, ALT, 
+           FST, FST_Z_SCORE, FST_P_VALUE, FST_P_ADJ,
+           DXY, DXY_Z_SCORE, DXY_P_VALUE, DXY_P_ADJ,
+           PI_LOBED, PI_LOBED_Z_SCORE, PI_LOBED_P_VALUE, PI_LOBED_P_ADJ,
+           PI_ROUND, PI_ROUND_Z_SCORE, PI_ROUND_P_VALUE, PI_ROUND_P_ADJ)
+  
+  return(significant_sites)
+}
+
+# Function to generate Manhattan plots for genome-wide visualization
+create_manhattan_plot <- function(windowed_data, output_dir) {
+  cat("Creating Manhattan plots for genome-wide visualization...\n")
+  
+  # Calculate chromosomal offsets for Manhattan plotting
+  chrom_offsets <- data.frame(CHROM = unique(windowed_data$CHROM))
+  chrom_offsets$CHROM_SIZE <- sapply(chrom_offsets$CHROM, function(chr) {
+    max(windowed_data$END[windowed_data$CHROM == chr], na.rm = TRUE)
+  })
+  
+  # Sort chromosomes
+  chrom_nums <- as.numeric(gsub("chr", "", gsub("Chr_", "", chrom_offsets$CHROM)))
+  chrom_offsets <- chrom_offsets[order(chrom_nums),]
+  
+  # Calculate offsets
+  chrom_offsets$offset <- c(0, cumsum(chrom_offsets$CHROM_SIZE[-nrow(chrom_offsets)] + 5000000))
+  
+  # Add offsets to windowed data
+  windowed_data$plot_pos <- 0
+  for(i in 1:nrow(chrom_offsets)) {
+    chrom <- chrom_offsets$CHROM[i]
+    offset <- chrom_offsets$offset[i]
+    windowed_data$plot_pos[windowed_data$CHROM == chrom] <- windowed_data$START[windowed_data$CHROM == chrom] + offset
+  }
+  
+  # Calculate mid-point of each chromosome for x-axis labels
+  chrom_labels <- data.frame(
+    CHROM = chrom_offsets$CHROM,
+    mid_pos = chrom_offsets$offset + (chrom_offsets$CHROM_SIZE / 2)
+  )
+  
+  # Calculate FDR significance thresholds for each metric (95th percentile)
+  fst_sig_threshold <- quantile(windowed_data$MEAN_FST, 0.95, na.rm = TRUE)
+  hudson_fst_sig_threshold <- quantile(windowed_data$MEAN_HUDSON_FST, 0.95, na.rm = TRUE)
+  wc_fst_sig_threshold <- quantile(windowed_data$MEAN_WC_FST, 0.95, na.rm = TRUE)
+  dxy_sig_threshold <- quantile(windowed_data$MEAN_DXY, 0.95, na.rm = TRUE)
+  
+  # Create Manhattan plots for different FST metrics with FDR significance lines
+  fst_manhattan <- ggplot(windowed_data, aes(x = plot_pos, y = MEAN_FST, color = CHROM)) +
+    geom_point(alpha = 0.7, size = 1.2) +
+    scale_color_manual(values = rep(c("#0072B2", "#D55E00"), length(unique(windowed_data$CHROM)))) +
+    geom_hline(yintercept = fst_sig_threshold, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(
+      title = "Manhattan Plot of Nei's FST Across the Genome",
+      subtitle = paste("FDR significance threshold (p < 0.05): ", round(fst_sig_threshold, 4)),
+      x = "Chromosomal Position",
+      y = "FST"
+    ) +
+    scale_x_continuous(
+      breaks = chrom_labels$mid_pos,
+      labels = chrom_labels$CHROM
+    ) +
+    ylim(-0.05, 0.35)
+  
+  hudson_fst_manhattan <- ggplot(windowed_data, aes(x = plot_pos, y = MEAN_HUDSON_FST, color = CHROM)) +
+    geom_point(alpha = 0.7, size = 1.2) +
+    scale_color_manual(values = rep(c("#0072B2", "#D55E00"), length(unique(windowed_data$CHROM)))) +
+    geom_hline(yintercept = hudson_fst_sig_threshold, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(
+      title = "Manhattan Plot of Hudson's FST Across the Genome",
+      subtitle = paste("FDR significance threshold (p < 0.05): ", round(hudson_fst_sig_threshold, 4)),
+      x = "Chromosomal Position",
+      y = "Hudson's FST"
+    ) +
+    scale_x_continuous(
+      breaks = chrom_labels$mid_pos,
+      labels = chrom_labels$CHROM
+    ) +
+    ylim(-0.05, 0.35)
+  
+  wc_fst_manhattan <- ggplot(windowed_data, aes(x = plot_pos, y = MEAN_WC_FST, color = CHROM)) +
+    geom_point(alpha = 0.7, size = 1.2) +
+    scale_color_manual(values = rep(c("#0072B2", "#D55E00"), length(unique(windowed_data$CHROM)))) +
+    geom_hline(yintercept = wc_fst_sig_threshold, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(
+      title = "Manhattan Plot of Weir & Cockerham's FST Across the Genome",
+      subtitle = paste("FDR significance threshold (p < 0.05): ", round(wc_fst_sig_threshold, 4)),
+      x = "Chromosomal Position",
+      y = "Weir & Cockerham's FST"
+    ) +
+    scale_x_continuous(
+      breaks = chrom_labels$mid_pos,
+      labels = chrom_labels$CHROM
+    ) +
+    ylim(-0.05, 0.35)
+  
+  # Create a Manhattan plot for DXY
+  dxy_manhattan <- ggplot(windowed_data, aes(x = plot_pos, y = MEAN_DXY, color = CHROM)) +
+    geom_point(alpha = 0.7, size = 1.2) +
+    scale_color_manual(values = rep(c("#0072B2", "#D55E00"), length(unique(windowed_data$CHROM)))) +
+    geom_hline(yintercept = dxy_sig_threshold, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      panel.grid.minor.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(
+      title = "Manhattan Plot of DXY Across the Genome",
+      subtitle = paste("FDR significance threshold (p < 0.05): ", round(dxy_sig_threshold, 4)),
+      x = "Chromosomal Position",
+      y = "DXY"
+    ) +
+    scale_x_continuous(
+      breaks = chrom_labels$mid_pos,
+      labels = chrom_labels$CHROM
+    ) +
+    ylim(-0.05, 0.15)
+  
+  # Save plots to the output directory
+  ggsave(file.path(output_dir, "nei_fst_manhattan.png"), plot = fst_manhattan, width = 12, height = 6, dpi = 300, bg = "white")
+  ggsave(file.path(output_dir, "hudson_fst_manhattan.png"), plot = hudson_fst_manhattan, width = 12, height = 6, dpi = 300, bg = "white")
+  ggsave(file.path(output_dir, "wc_fst_manhattan.png"), plot = wc_fst_manhattan, width = 12, height = 6, dpi = 300, bg = "white")
+  ggsave(file.path(output_dir, "dxy_manhattan.png"), plot = dxy_manhattan, width = 12, height = 6, dpi = 300, bg = "white")
+  
+  # Combined FST Manhattan plots
+  fst_comparison_manhattan <- ggarrange(
+    fst_manhattan + labs(title = "Nei's FST"), 
+    hudson_fst_manhattan + labs(title = "Hudson's FST"), 
+    wc_fst_manhattan + labs(title = "Weir & Cockerham's FST"),
+    ncol = 1, labels = c("A", "B", "C")
+  )
+  
+  ggsave(file.path(output_dir, "fst_comparison_manhattan.png"), 
+         plot = fst_comparison_manhattan, width = 12, height = 15, dpi = 300, bg = "white")
+  
+  cat("Manhattan plots created and saved to", output_dir, "\n")
+  
+  return(TRUE)  # Return value to confirm function executed
+}
+
+# Function to generate individual chromosome plots as scatter plots with trend lines
+generate_individual_chromosome_plots <- function(chromosome_summary, windowed_summary, output_dir) {
+  cat("Generating detailed scatter plots for each chromosome...\n")
+  
+  # Get unique chromosomes
+  chromosomes <- unique(windowed_summary$CHROM)
+  
+  # Extract genome-wide means and standard deviations
+  genome_means <- attr(chromosome_summary, "genome_means")
+  genome_sds <- attr(chromosome_summary, "genome_sds")
+  
+  # Process each chromosome
+  for(chrom in chromosomes) {
+    cat("Creating scatter plots for chromosome:", chrom, "\n")
+    
+    # Filter data for this chromosome
+    chrom_data <- windowed_summary[windowed_summary$CHROM == chrom,]
+    
+    # Calculate significance thresholds using FDR
+    fst_sig_threshold <- quantile(chrom_data$MEAN_FST, 0.95, na.rm = TRUE)
+    hudson_fst_sig_threshold <- quantile(chrom_data$MEAN_HUDSON_FST, 0.95, na.rm = TRUE)
+    wc_fst_sig_threshold <- quantile(chrom_data$MEAN_WC_FST, 0.95, na.rm = TRUE)
+    dxy_sig_threshold <- quantile(chrom_data$MEAN_DXY, 0.95, na.rm = TRUE)
+    
+    # FST plots - one for each method
+    p1 <- ggplot(chrom_data, aes(x = START, y = MEAN_FST)) +
+      geom_point(alpha = 0.7, size = 1.2, color = "#0072B2") +
+      geom_smooth(method = "loess", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      geom_hline(yintercept = genome_means["FST"], linetype = "dashed", color = "black") +
+      geom_hline(yintercept = fst_sig_threshold, linetype = "dashed", color = "red") +
+      theme_bw() +
+      labs(title = paste("Nei's FST along", chrom),
+           subtitle = paste("Black dashed line: genome-wide mean (", round(genome_means["FST"], 4), 
+                            "); Red dashed line: FDR significance (p < 0.05)"),
+           x = "Position (bp)",
+           y = "FST") +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      ) +
+      scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+      ylim(0.0, 0.35)
+    
+    p1b <- ggplot(chrom_data, aes(x = START, y = MEAN_HUDSON_FST)) +
+      geom_point(alpha = 0.7, size = 1.2, color = "#56B4E9") +
+      geom_smooth(method = "loess", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      geom_hline(yintercept = genome_means["HUDSON_FST"], linetype = "dashed", color = "black") +
+      geom_hline(yintercept = hudson_fst_sig_threshold, linetype = "dashed", color = "red") +
+      theme_bw() +
+      labs(title = paste("Hudson's FST along", chrom),
+           subtitle = paste("Black dashed line: genome-wide mean (", round(genome_means["HUDSON_FST"], 4), 
+                            "); Red dashed line: FDR significance (p < 0.05)"),
+           x = "Position (bp)",
+           y = "Hudson's FST") +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      ) +
+      scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+      ylim(0.2, 0.8)
+    
+    p1c <- ggplot(chrom_data, aes(x = START, y = MEAN_WC_FST)) +
+      geom_point(alpha = 0.7, size = 1.2, color = "#009E73") +
+      geom_smooth(method = "loess", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      geom_hline(yintercept = genome_means["WC_FST"], linetype = "dashed", color = "black") +
+      geom_hline(yintercept = wc_fst_sig_threshold, linetype = "dashed", color = "red") +
+      theme_bw() +
+      labs(title = paste("Weir & Cockerham's FST along", chrom),
+           subtitle = paste("Black dashed line: genome-wide mean (", round(genome_means["WC_FST"], 4), 
+                            "); Red dashed line: FDR significance (p < 0.05)"),
+           x = "Position (bp)",
+           y = "Weir & Cockerham's FST") +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      ) +
+      scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+      ylim(0.1, 0.75)
+    
+    # Pi and DXY plot with loess trend lines - combined for overlay
+    pi_dxy_plot <- ggplot(chrom_data, aes(x = START)) +
+      geom_line(aes(y = MEAN_PI_LOBED, color = "Laciniatus Pi"), alpha = 0.7) +
+      geom_line(aes(y = MEAN_PI_ROUND, color = "Guttatus Pi"), alpha = 0.7) +
+      geom_line(aes(y = MEAN_DXY, color = "DXY"), alpha = 0.7) +
+      geom_smooth(aes(y = MEAN_PI_LOBED, color = "Laciniatus Pi"), method = "loess", se = FALSE, linetype = "solid") +
+      geom_smooth(aes(y = MEAN_PI_ROUND, color = "Guttatus Pi"), method = "loess", se = FALSE, linetype = "solid") +
+      geom_smooth(aes(y = MEAN_DXY, color = "DXY"), method = "loess", se = FALSE, linetype = "solid") +
+      geom_hline(yintercept = genome_means["PI_LOBED"], linetype = "dashed", color = "#0072B2") +
+      geom_hline(yintercept = genome_means["PI_ROUND"], linetype = "dashed", color = "#E69F00") +
+      geom_hline(yintercept = genome_means["DXY"], linetype = "dashed", color = "#CC79A7") +
+      geom_hline(yintercept = dxy_sig_threshold, linetype = "dashed", color = "red") +
+      scale_color_manual(values = c("Laciniatus Pi" = "#0072B2", "Guttatus Pi" = "#E69F00", "DXY" = "#CC79A7")) +
+      theme_bw() +
+      labs(title = paste("Nucleotide Diversity and DXY along", chrom),
+           subtitle = paste("Dashed lines: genome-wide means; Red dashed line: DXY FDR significance (p < 0.05)"),
+           x = "Position (bp)",
+           y = "Value") +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        legend.position = "top",
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      ) +
+      scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+      ylim(-0.0, 0.03)
+    
+    # Correlation scatter plot: FST vs Pi
+    fst_vs_pi_lobed <- ggplot(chrom_data, aes(x = MEAN_FST, y = MEAN_PI_LOBED)) +
+      geom_point(alpha = 0.7, color = "#0072B2") +
+      geom_smooth(method = "lm", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      theme_bw() +
+      labs(title = paste("FST vs Laciniatus Pi", chrom),
+           subtitle = paste("Correlation:", round(cor(chrom_data$MEAN_FST, chrom_data$MEAN_PI_LOBED, use = "complete.obs"), 3),
+                            ", p =", format.pval(cor.test(chrom_data$MEAN_FST, chrom_data$MEAN_PI_LOBED, 
+                                                          use = "complete.obs")$p.value, digits = 3)),
+           x = "FST",
+           y = "Laciniatus Pi") +
+      theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      )
+    
+    fst_vs_pi_round <- ggplot(chrom_data, aes(x = MEAN_FST, y = MEAN_PI_ROUND)) +
+      geom_point(alpha = 0.7, color = "#E69F00") +
+      geom_smooth(method = "lm", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      theme_bw() +
+      labs(title = paste("FST vs Guttatus Pi", chrom),
+           subtitle = paste("Correlation:", round(cor(chrom_data$MEAN_FST, chrom_data$MEAN_PI_ROUND, use = "complete.obs"), 3),
+                            ", p =", format.pval(cor.test(chrom_data$MEAN_FST, chrom_data$MEAN_PI_ROUND, 
+                                                          use = "complete.obs")$p.value, digits = 3)),
+           x = "FST",
+           y = "Guttatus Pi") +
+      theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      )
+    
+    # FST vs DXY correlation
+    fst_vs_dxy <- ggplot(chrom_data, aes(x = MEAN_FST, y = MEAN_DXY)) +
+      geom_point(alpha = 0.7, color = "#CC79A7") +
+      geom_smooth(method = "lm", se = TRUE, color = "#D55E00", fill = "#D55E00", alpha = 0.2) +
+      theme_bw() +
+      labs(title = paste("FST vs. DXY Correlation for", chrom),
+           subtitle = paste("Correlation:", round(cor(chrom_data$MEAN_FST, chrom_data$MEAN_DXY, use = "complete.obs"), 3),
+                            ", p =", format.pval(cor.test(chrom_data$MEAN_FST, chrom_data$MEAN_DXY, 
+                                                          use = "complete.obs")$p.value, digits = 3)),
+           x = "FST",
+           y = "DXY") +
+      theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "grey30"),
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      )
+    
+    # Combine all plots
+    combined_plot <- ggarrange(
+      p1, p1b, p1c, 
+      pi_dxy_plot, 
+      ggarrange(fst_vs_pi_lobed, fst_vs_pi_round, fst_vs_dxy, ncol = 3),
+      ncol = 1, 
+      heights = c(1, 1, 1, 1.5, 1),
+      labels = c("A", "B", "C", "D", "E")
+    )
+    
+    # Save the combined plot at high resolution for publication
+    ggsave(file.path(output_dir, paste0(chrom, "_scatter_plot.png")), 
+           plot = combined_plot, width = 12, height = 15, dpi = 300, bg = "white")
+    
+    # Create a PDF version for vector graphics (better for publications)
+    ggsave(file.path(output_dir, paste0(chrom, "_scatter_plot.pdf")), 
+           plot = combined_plot, width = 12, height = 15, bg = "white")
+  }
+  
+  cat("Publication-quality scatter plots created and saved to", output_dir, "\n")
+}
+
+# Function to generate plots with significance indicators and lines
+generate_plots <- function(chromosome_summary, windowed_summary, output_dir) {
+  cat("Generating publication-quality colorblind-friendly plots with significance indicators and lines...\n")
+  
+  # Extract genome-wide means for significance lines
+  genome_means <- attr(chromosome_summary, "genome_means")
+  
+  # Sort chromosomes in numerical order for plotting
+  chromosome_summary$CHROM <- factor(chromosome_summary$CHROM,
+                                     levels = chromosome_summary$CHROM[order(as.numeric(gsub("Chr_", "", chromosome_summary$CHROM)))])
+  
+  # Colorblind-friendly palette
+  cb_palette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+  
+  # 1. FST by chromosome with FDR significance and genome-wide mean line
+  fst_chrom_plot_fdr <- ggplot(chromosome_summary, aes(x = CHROM, y = MEAN_FST)) +
+    geom_bar(stat = "identity", fill = "#0072B2") +
+    geom_text(aes(label = FST_SIG_FDR), vjust = -0.5, size = 5) +
+    geom_hline(yintercept = genome_means["FST"], linetype = "dashed", color = "#D55E00") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(title = "Mean Nei's FST by Chromosome",
+         subtitle = paste("(FDR adjusted)",
+                          "\nDashed line: genome-wide mean (", round(genome_means["FST"], 4), ")"),
+         x = "Chromosome",
+         y = "FST") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(labels = function(x) sprintf("%.4f", x))
+  
+  # Save FST chromosome plot (FDR)
+  fst_chrom_fdr_file <- file.path(output_dir, "mean_fst_by_chromosome_fdr.png")
+  ggsave(fst_chrom_fdr_file, plot = fst_chrom_plot_fdr, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # Hudson's FST by chromosome with FDR significance
+  hudson_fst_chrom_plot_fdr <- ggplot(chromosome_summary, aes(x = CHROM, y = MEAN_HUDSON_FST)) +
+    geom_bar(stat = "identity", fill = "#56B4E9") +
+    geom_text(aes(label = HUDSON_FST_SIG_FDR), vjust = -0.5, size = 5) +
+    geom_hline(yintercept = genome_means["HUDSON_FST"], linetype = "dashed", color = "#D55E00") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(title = "Mean Hudson's FST by Chromosome",
+         subtitle = paste("(FDR adjusted)",
+                          "\nDashed line: genome-wide mean (", round(genome_means["HUDSON_FST"], 4), ")"),
+         x = "Chromosome",
+         y = "Hudson's FST") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Save Hudson's FST chromosome plot (FDR)
+  hudson_fst_chrom_fdr_file <- file.path(output_dir, "mean_hudson_fst_by_chromosome_fdr.png")
+  ggsave(hudson_fst_chrom_fdr_file, plot = hudson_fst_chrom_plot_fdr, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # Weir & Cockerham's FST by chromosome with FDR significance
+  wc_fst_chrom_plot_fdr <- ggplot(chromosome_summary, aes(x = CHROM, y = MEAN_WC_FST)) +
+    geom_bar(stat = "identity", fill = "#009E73") +
+    geom_text(aes(label = WC_FST_SIG_FDR), vjust = -0.5, size = 5) +
+    geom_hline(yintercept = genome_means["WC_FST"], linetype = "dashed", color = "#D55E00") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(title = "Mean Weir & Cockerham's FST by Chromosome",
+         subtitle = paste("(FDR adjusted)",
+                          "\nDashed line: genome-wide mean (", round(genome_means["WC_FST"], 4), ")"),
+         x = "Chromosome",
+         y = "Weir & Cockerham's FST") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Save Weir & Cockerham's FST chromosome plot (FDR)
+  wc_fst_chrom_fdr_file <- file.path(output_dir, "mean_wc_fst_by_chromosome_fdr.png")
+  ggsave(wc_fst_chrom_fdr_file, plot = wc_fst_chrom_plot_fdr, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # 2. Pi by chromosome with FDR significance and genome-wide mean lines
+  pi_data_fdr <- chromosome_summary %>%
+    select(CHROM, MEAN_PI_LOBED, MEAN_PI_ROUND, PI_LOBED_SIG_FDR, PI_ROUND_SIG_FDR) %>%
+    pivot_longer(cols = c(MEAN_PI_LOBED, MEAN_PI_ROUND),
+                 names_to = "Population",
+                 values_to = "Pi") %>%
+    mutate(
+      Population = ifelse(Population == "MEAN_PI_LOBED", "Laciniatus", "Guttatus"),
+      Significance = ifelse(Population == "Laciniatus", PI_LOBED_SIG_FDR, PI_ROUND_SIG_FDR)
+    )
+  
+  pi_chrom_plot_fdr <- ggplot(pi_data_fdr, aes(x = CHROM, y = Pi, fill = Population)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_text(aes(label = Significance, group = Population),
+              position = position_dodge(width = 0.8), vjust = -0.5, size = 4) +
+    geom_hline(yintercept = genome_means["PI_LOBED"], linetype = "dashed", color = "#0072B2") +
+    geom_hline(yintercept = genome_means["PI_ROUND"], linetype = "dashed", color = "#E69F00") +
+    scale_fill_manual(values = c("Laciniatus" = "#0072B2", "Guttatus" = "#E69F00")) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(title = "Mean Nucleotide Diversity (Pi) by Chromosome",
+         subtitle = paste("* p<0.05, ** p<0.01, *** p<0.001 (FDR adjusted)",
+                          "\nDashed lines: genome-wide means (Laciniatus: ", round(genome_means["PI_LOBED"], 4),
+                          ", Guttatus: ", round(genome_means["PI_ROUND"], 4), ")"),
+         x = "Chromosome",
+         y = "Pi") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Save Pi chromosome plot (FDR)
+  pi_chrom_fdr_file <- file.path(output_dir, "mean_pi_by_chromosome_fdr.png")
+  ggsave(pi_chrom_fdr_file, plot = pi_chrom_plot_fdr, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # 3. DXY by chromosome with FDR significance and genome-wide mean line
+  dxy_chrom_plot_fdr <- ggplot(chromosome_summary, aes(x = CHROM, y = MEAN_DXY)) +
+    geom_bar(stat = "identity", fill = "#CC79A7") +
+    geom_text(aes(label = DXY_SIG_FDR), vjust = -0.5, size = 5) +
+    geom_hline(yintercept = genome_means["DXY"], linetype = "dashed", color = "#D55E00") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    ) +
+    labs(title = "Mean DXY by Chromosome",
+         subtitle = paste("* p<0.05, ** p<0.01, *** p<0.001 (FDR adjusted)",
+                          "\nDashed line: genome-wide mean (", round(genome_means["DXY"], 4), ")"),
+         x = "Chromosome",
+         y = "DXY") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Save DXY chromosome plot (FDR)
+  dxy_chrom_fdr_file <- file.path(output_dir, "mean_dxy_by_chromosome_fdr.png")
+  ggsave(dxy_chrom_fdr_file, plot = dxy_chrom_plot_fdr, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # Generate other plots (individual chromosome plots, Manhattan plots)
+  generate_individual_chromosome_plots(chromosome_summary, windowed_summary, chrom_plots_dir)
+  create_manhattan_plot(windowed_summary, advanced_plots_dir)
+  
+  # Generate FST comparison plots
+  generate_fst_comparison_plots(chromosome_summary, windowed_summary, fst_comparison_dir)
+  
+  cat("All plots generated and saved to", output_dir, " and subfolders\n")
+}
+
+# Function to generate FST comparison plots
+generate_fst_comparison_plots <- function(chromosome_summary, windowed_summary, output_dir) {
+  cat("Generating FST comparison plots...\n")
+  
+  # Extract genome-wide means for reference lines
+  genome_means <- attr(chromosome_summary, "genome_means")
+  
+  # 1. Scatter plot comparing all three FST metrics
+  # First, prepare the data for scatter plots
+  # Sample a subset of windowed data for clearer visualization if there are many points
+  set.seed(123) # For reproducibility
+  sample_size <- min(5000, nrow(windowed_summary))
+  windowed_sample <- windowed_summary[sample(nrow(windowed_summary), sample_size), ]
+  
+  # Create pairwise comparison scatter plots with p-values
+  nei_vs_hudson_cor_test <- cor.test(windowed_sample$MEAN_FST, windowed_sample$MEAN_HUDSON_FST, use = "complete.obs")
+  nei_vs_hudson <- ggplot(windowed_sample, aes(x = MEAN_FST, y = MEAN_HUDSON_FST)) +
+    geom_point(alpha = 0.5, color = "#0072B2") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#D55E00") +
+    geom_smooth(method = "lm", se = TRUE, color = "#CC79A7", fill = "#CC79A7", alpha = 0.2) +
+    labs(title = "Comparison: Nei's FST vs Hudson's FST",
+         subtitle = paste("Correlation:", round(nei_vs_hudson_cor_test$estimate, 3),
+                          ", p =", format.pval(nei_vs_hudson_cor_test$p.value, digits = 3)),
+         x = "Nei's FST",
+         y = "Hudson's FST") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    )
+  
+  nei_vs_wc_cor_test <- cor.test(windowed_sample$MEAN_FST, windowed_sample$MEAN_WC_FST, use = "complete.obs")
+  nei_vs_wc <- ggplot(windowed_sample, aes(x = MEAN_FST, y = MEAN_WC_FST)) +
+    geom_point(alpha = 0.5, color = "#0072B2") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#D55E00") +
+    geom_smooth(method = "lm", se = TRUE, color = "#CC79A7", fill = "#CC79A7", alpha = 0.2) +
+    labs(title = "Comparison: Nei's FST vs Weir & Cockerham's FST",
+         subtitle = paste("Correlation:", round(nei_vs_wc_cor_test$estimate, 3),
+                          ", p =", format.pval(nei_vs_wc_cor_test$p.value, digits = 3)),
+         x = "Nei's FST",
+         y = "Weir & Cockerham's FST") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    )
+  
+  hudson_vs_wc_cor_test <- cor.test(windowed_sample$MEAN_HUDSON_FST, windowed_sample$MEAN_WC_FST, use = "complete.obs")
+  hudson_vs_wc <- ggplot(windowed_sample, aes(x = MEAN_HUDSON_FST, y = MEAN_WC_FST)) +
+    geom_point(alpha = 0.5, color = "#0072B2") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#D55E00") +
+    geom_smooth(method = "lm", se = TRUE, color = "#CC79A7", fill = "#CC79A7", alpha = 0.2) +
+    labs(title = "Comparison: Hudson's FST vs Weir & Cockerham's FST",
+         subtitle = paste("Correlation:", round(hudson_vs_wc_cor_test$estimate, 3),
+                          ", p =", format.pval(hudson_vs_wc_cor_test$p.value, digits = 3)),
+         x = "Hudson's FST",
+         y = "Weir & Cockerham's FST") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white")
+    )
+  
+  # Create FST vs Pi correlation plot with p-values
+  fst_pi_lobed_cor_test <- cor.test(windowed_sample$MEAN_FST, windowed_sample$MEAN_PI_LOBED, use = "complete.obs")
+  fst_pi_round_cor_test <- cor.test(windowed_sample$MEAN_FST, windowed_sample$MEAN_PI_ROUND, use = "complete.obs")
+  
+  fst_vs_pi_corr <- ggplot(windowed_sample, aes(x = MEAN_FST)) +
+    geom_point(aes(y = MEAN_PI_LOBED, color = "Laciniatus Pi"), alpha = 0.5) +
+    geom_point(aes(y = MEAN_PI_ROUND, color = "Guttatus Pi"), alpha = 0.5) +
+    geom_smooth(aes(y = MEAN_PI_LOBED, color = "Laciniatus Pi"), method = "lm", se = TRUE, alpha = 0.2) +
+    geom_smooth(aes(y = MEAN_PI_ROUND, color = "Guttatus Pi"), method = "lm", se = TRUE, alpha = 0.2) +
+    scale_color_manual(values = c("Laciniatus Pi" = "#0072B2", "Guttatus Pi" = "#E69F00")) +
+    labs(title = "Correlation: FST vs Nucleotide Diversity",
+         subtitle = paste(
+           "Laciniatus Pi: r=", round(fst_pi_lobed_cor_test$estimate, 3),
+           ", p=", format.pval(fst_pi_lobed_cor_test$p.value, digits = 3),
+           "\nGuttatus Pi: r=", round(fst_pi_round_cor_test$estimate, 3),
+           ", p=", format.pval(fst_pi_round_cor_test$p.value, digits = 3)
+         ),
+         x = "FST",
+         y = "Pi") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white"),
+      legend.position = "top"
+    )
+  
+  # Combine and save pairwise scatter plots
+  pairwise_scatter <- ggarrange(
+    nei_vs_hudson, nei_vs_wc, 
+    hudson_vs_wc, fst_vs_pi_corr,
+    ncol = 2, nrow = 2, 
+    labels = c("A", "B", "C", "D")
+  )
+  
+  # Add an overall title to the combined plot
+  pairwise_scatter_with_title <- annotate_figure(pairwise_scatter,
+                                                 top = text_grob("Comparison of Different FST Calculation Methods", 
+                                                                 face = "bold", size = 14))
+  
+  ggsave(file.path(output_dir, "fst_pairwise_comparisons.png"), 
+         plot = pairwise_scatter_with_title, width = 12, height = 10, dpi = 300, bg = "white")
+  
+  # 2. Bar plot comparing genome-wide means of all three FST metrics
+  fst_means <- data.frame(
+    Method = c("Nei's FST", "Hudson's FST", "Weir & Cockerham's FST"),
+    Mean = c(genome_means["FST"], genome_means["HUDSON_FST"], genome_means["WC_FST"])
+  )
+  
+  fst_means_plot <- ggplot(fst_means, aes(x = Method, y = Mean, fill = Method)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_text(aes(label = round(Mean, 4)), vjust = -0.5, size = 4) +
+    scale_fill_manual(values = c("Nei's FST" = "#0072B2", 
+                                 "Hudson's FST" = "#56B4E9", 
+                                 "Weir & Cockerham's FST" = "#009E73")) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white"),
+      legend.position = "none"
+    ) +
+    labs(title = "Comparison of Genome-wide Mean FST Values",
+         subtitle = "Different calculation methods yield different estimates",
+         x = "",
+         y = "Mean FST")
+  
+  ggsave(file.path(output_dir, "fst_methods_comparison.png"), 
+         plot = fst_means_plot, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  # Combined density plot
+  fst_values <- windowed_summary %>%
+    select(CHROM, START, END, MEAN_FST, MEAN_HUDSON_FST, MEAN_WC_FST) %>%
+    pivot_longer(cols = c(MEAN_FST, MEAN_HUDSON_FST, MEAN_WC_FST),
+                 names_to = "Method",
+                 values_to = "FST") %>%
+    mutate(Method = case_when(
+      Method == "MEAN_FST" ~ "Nei's FST",
+      Method == "MEAN_HUDSON_FST" ~ "Hudson's FST",
+      Method == "MEAN_WC_FST" ~ "Weir & Cockerham's FST"
+    ))
+  
+  density_plot <- ggplot(fst_values, aes(x = FST, fill = Method)) +
+    geom_density(alpha = 0.5) +
+    geom_vline(data = data.frame(Method = c("Nei's FST", "Hudson's FST", "Weir & Cockerham's FST"),
+                                 Mean = c(genome_means["FST"], 
+                                          genome_means["HUDSON_FST"], 
+                                          genome_means["WC_FST"])),
+               aes(xintercept = Mean, color = Method),
+               linetype = "dashed", size = 1) +
+    scale_fill_manual(values = c("Nei's FST" = "#0072B2", 
+                                 "Hudson's FST" = "#56B4E9", 
+                                 "Weir & Cockerham's FST" = "#009E73")) +
+    scale_color_manual(values = c("Nei's FST" = "#0072B2", 
+                                  "Hudson's FST" = "#56B4E9", 
+                                  "Weir & Cockerham's FST" = "#009E73")) +
+    theme_minimal() +
+    labs(title = "Density Distribution of FST Values",
+         subtitle = "Comparing three different calculation methods",
+         x = "FST",
+         y = "Density") +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white"),
+      legend.position = "top"
+    )
+  
+  ggsave(file.path(output_dir, "fst_distribution_comparison.png"), 
+         plot = density_plot, width = 10, height = 6, dpi = 300, bg = "white")
+  
+  cat("FST comparison plots created and saved to", output_dir, "\n")
+}
+
+# Main execution function
+run_analysis <- function(lobed_file, round_file, output_dir) {
+  # 1. Parse the population files
+  cat("Starting population genetics analysis...\n")
+  
+  # Parse lobed population data
+  lobed_data <- parse_population_file(lobed_file, "Lobed")
+  
+  # Parse round population data
+  round_data <- parse_population_file(round_file, "Round")
+  
+  # 2. Calculate site-by-site statistics
+  site_stats <- calculate_pop_stats(lobed_data, round_data)
+  
+  # Save site-by-site statistics (now including FST calculations for all sites)
+  site_stats_file <- file.path(tables_dir, "site_statistics.txt")
+  write.table(site_stats, site_stats_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 3. Calculate chromosome summaries
+  chrom_summary <- summarize_by_chrom(site_stats)
+  
+  # Save chromosome summary
+  chrom_summary_file <- file.path(tables_dir, "chromosome_summary.txt")
+  write.table(chrom_summary, chrom_summary_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 4. Calculate windowed statistics
+  window_stats <- calculate_windowed_stats(site_stats)
+  
+  # Save windowed statistics
+  window_stats_file <- file.path(tables_dir, "windowed_statistics.txt")
+  write.table(window_stats, window_stats_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 5. Identify FST outlier windows
+  fst_outliers <- identify_fst_outliers(window_stats)
+  
+  # Save FST outlier windows
+  fst_outliers_file <- file.path(tables_dir, "fst_outlier_windows.txt")
+  write.table(fst_outliers, fst_outliers_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 6. Identify genomic islands of divergence
+  genomic_islands <- identify_genomic_islands(fst_outliers)
+  
+  # Save genomic islands information
+  islands_file <- file.path(tables_dir, "genomic_islands.txt")
+  write.table(genomic_islands, islands_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 7. Identify top outlier sites
+  top_outliers <- identify_top_outliers(site_stats)
+  
+  # Save top outlier site information
+  top_fst_file <- file.path(tables_dir, "top_fst_outliers.txt")
+  write.table(top_outliers$top_fst, top_fst_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  top_pi_file <- file.path(tables_dir, "top_pi_outliers.txt")
+  write.table(top_outliers$top_pi_diff, top_pi_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  top_dxy_file <- file.path(tables_dir, "top_dxy_outliers.txt")
+  write.table(top_outliers$top_dxy, top_dxy_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # Save sites with values >3SD from the mean
+  sites_3sd_file <- file.path(tables_dir, "sites_exceeding_3sd.txt")
+  write.table(top_outliers$outliers_3sd, sites_3sd_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 8. Create table of significant sites
+  significant_sites <- create_significance_table(site_stats)
+  
+  # Save significant sites table
+  significant_sites_file <- file.path(tables_dir, "significant_sites.txt")
+  write.table(significant_sites, significant_sites_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  # 9. Generate plots
+  generate_plots(chrom_summary, window_stats, output_dir)
+  
+  # 10. Create a summary of all tables generated
+  summary_tables <- data.frame(
+    Table_Name = c(
+      "chromosome_summary.txt",
+      "site_statistics.txt", 
+      "windowed_statistics.txt", 
+      "fst_outlier_windows.txt", 
+      "genomic_islands.txt", 
+      "top_fst_outliers.txt", 
+      "top_pi_outliers.txt", 
+      "top_dxy_outliers.txt",
+      "significant_sites.txt",
+      "sites_exceeding_3sd.txt"
+    ),
+    Description = c(
+      "Summary statistics for each chromosome including significance tests with FDR correction",
+      "FST, Pi, and DXY calculations for all individual sites",
+      "Windowed statistics across the genome (25kb windows, 10kb steps)",
+      "Windows identified as FST outliers across all three FST metrics (>95th percentile)",
+      "Genomic islands of divergence (consecutive outlier windows)",
+      "Top 100 FST outlier sites across the genome",
+      "Top 100 nucleotide diversity (Pi) differential outlier sites",
+      "Top 100 DXY outlier sites",
+      "Sites with statistically significant values after FDR correction (p < 0.05)",
+      "Sites with values exceeding 3 standard deviations from the genome-wide mean"
+    ),
+    Number_of_Rows = c(
+      nrow(chrom_summary),
+      nrow(site_stats),
+      nrow(window_stats),
+      nrow(fst_outliers),
+      nrow(genomic_islands),
+      nrow(top_outliers$top_fst),
+      nrow(top_outliers$top_pi_diff),
+      nrow(top_outliers$top_dxy),
+      nrow(significant_sites),
+      nrow(top_outliers$outliers_3sd)
+    )
+  )
+  
+  # Save table summary
+  table_summary_file <- file.path(tables_dir, "table_summary.txt")
+  write.table(summary_tables, table_summary_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  cat("Analysis complete. All results saved to", output_dir, "\n")
+  cat("Tables saved to", tables_dir, "\n")
+}
+
+# Main execution ---------------------------------
+# Specify the input files
+args <- commandArgs(trailingOnly = TRUE)
+
+if (length(args) >= 3) {
+  lobed_file <- args[1]
+  round_file <- args[2]
+  output_dir <- args[3]
+} else {
+  # Default values if not provided
+  cat("Using default file paths. To specify custom paths, use:\n")
+  cat("Rscript population_genetics.R lobed_file.txt round_file.txt output_directory\n\n")
+}
+
+# Run the analysis
+run_analysis(lobed_file, round_file, output_dir)
